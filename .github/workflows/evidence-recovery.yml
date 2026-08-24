@@ -1,0 +1,118 @@
+name: Evidence recovery package
+
+on:
+  push:
+    branches:
+      - evidence-recovery-20260824
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build deterministic inventory and XVG summaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence_recovery/repository_snapshot
+          rsync -a --exclude='.git' --exclude='evidence_recovery' ./ evidence_recovery/repository_snapshot/
+          python - <<'PY'
+          from __future__ import annotations
+          import csv, hashlib, json, math, os
+          from pathlib import Path
+          from statistics import mean, pstdev
+
+          root = Path('.')
+          out = Path('evidence_recovery')
+          inventory = []
+          for p in sorted(root.rglob('*')):
+              if not p.is_file() or '.git' in p.parts or 'evidence_recovery' in p.parts:
+                  continue
+              data = p.read_bytes()
+              inventory.append({
+                  'path': p.as_posix(),
+                  'size_bytes': len(data),
+                  'sha256': hashlib.sha256(data).hexdigest(),
+                  'suffix': p.suffix.lower(),
+              })
+          with (out / 'repository_inventory.csv').open('w', newline='', encoding='utf-8') as f:
+              w = csv.DictWriter(f, fieldnames=['path','size_bytes','sha256','suffix'])
+              w.writeheader(); w.writerows(inventory)
+
+          summaries = []
+          for p in sorted(root.rglob('*.xvg')):
+              xs, ys = [], []
+              title = subtitle = xlab = ylab = ''
+              for raw in p.read_text(encoding='utf-8', errors='replace').splitlines():
+                  line = raw.strip()
+                  if line.startswith('@'):
+                      if 'title' in line and not line.startswith('@ subtitle'):
+                          title = line.split('title',1)[1].strip().strip('"')
+                      elif line.startswith('@ subtitle'):
+                          subtitle = line.split('subtitle',1)[1].strip().strip('"')
+                      elif 'xaxis' in line and 'label' in line:
+                          xlab = line.split('label',1)[1].strip().strip('"')
+                      elif 'yaxis' in line and 'label' in line:
+                          ylab = line.split('label',1)[1].strip().strip('"')
+                      continue
+                  if not line or line.startswith('#'):
+                      continue
+                  cols = line.split()
+                  if len(cols) < 2:
+                      continue
+                  try:
+                      x = float(cols[0]); y = float(cols[1])
+                  except ValueError:
+                      continue
+                  if math.isfinite(x) and math.isfinite(y):
+                      xs.append(x); ys.append(y)
+              if ys:
+                  summaries.append({
+                      'path': p.as_posix(),
+                      'n_points': len(ys),
+                      'x_min': min(xs), 'x_max': max(xs),
+                      'y_min': min(ys), 'y_max': max(ys),
+                      'y_mean': mean(ys),
+                      'y_sd_population': pstdev(ys) if len(ys) > 1 else 0.0,
+                      'first_y': ys[0], 'last_y': ys[-1],
+                      'title': title, 'subtitle': subtitle,
+                      'x_label': xlab, 'y_label': ylab,
+                  })
+          fields = ['path','n_points','x_min','x_max','y_min','y_max','y_mean','y_sd_population','first_y','last_y','title','subtitle','x_label','y_label']
+          with (out / 'xvg_summary.csv').open('w', newline='', encoding='utf-8') as f:
+              w = csv.DictWriter(f, fieldnames=fields)
+              w.writeheader(); w.writerows(summaries)
+
+          extensions = {}
+          for row in inventory:
+              extensions[row['suffix']] = extensions.get(row['suffix'], 0) + 1
+          gate = {
+              'repository': 'SUNHAOJUN22/Gromacs_protein_G4',
+              'commit': os.environ.get('GITHUB_SHA',''),
+              'file_count': len(inventory),
+              'extension_counts': extensions,
+              'has_xtc': any(r['suffix'] == '.xtc' for r in inventory),
+              'has_trr': any(r['suffix'] == '.trr' for r in inventory),
+              'has_tpr': any(r['suffix'] == '.tpr' or r['path'].endswith('#em.tpr.1#') for r in inventory),
+              'has_mdp': any(r['suffix'] == '.mdp' for r in inventory),
+              'has_top': any(r['suffix'] == '.top' or 'topol.top' in r['path'] for r in inventory),
+              'has_itp': any(r['suffix'] == '.itp' for r in inventory),
+              'has_pdb': any(r['suffix'] == '.pdb' for r in inventory),
+              'has_gro': any(r['suffix'] == '.gro' for r in inventory),
+              'has_xvg': any(r['suffix'] == '.xvg' for r in inventory),
+          }
+          (out / 'md_gate_status.json').write_text(json.dumps(gate, indent=2, ensure_ascii=False), encoding='utf-8')
+          PY
+
+      - name: Upload evidence recovery artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gromacs-protein-g4-evidence-recovery
+          path: evidence_recovery
+          if-no-files-found: error
+          retention-days: 30
