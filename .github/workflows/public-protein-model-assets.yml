@@ -1,0 +1,71 @@
+name: Public protein model asset integrity check
+
+on:
+  push:
+    branches: [tnfa-public-model-assets-20261104]
+    paths: [.github/workflows/public-protein-model-assets.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-protein-model-assets
+  cancel-in-progress: false
+
+jobs:
+  verify-public-assets:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Fetch and verify public upstream assets only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json, urllib.request, time
+          root = Path('public_model_assets')
+          root.mkdir()
+          manifest = {'scope': 'PUBLIC_UPSTREAM_ASSETS_ONLY_NO_USER_SEQUENCES', 'files': []}
+          def obtain(rel, url, expected=None, algo='sha256', limit=80_000_000):
+              p = root / rel
+              p.parent.mkdir(parents=True, exist_ok=True)
+              req = urllib.request.Request(url, headers={'User-Agent': 'public-model-integrity-check/1.0'})
+              started = time.time()
+              with urllib.request.urlopen(req, timeout=180) as r, p.open('xb') as f:
+                  total = 0
+                  while True:
+                      chunk = r.read(1024*1024)
+                      if not chunk: break
+                      total += len(chunk)
+                      if total > limit: raise RuntimeError('Asset exceeds size budget: '+rel)
+                      f.write(chunk)
+              data = p.read_bytes()
+              actual = hashlib.new(algo, data).hexdigest()
+              if expected is not None and actual != expected:
+                  raise RuntimeError('Upstream checksum mismatch: '+rel)
+              manifest['files'].append({'path': rel, 'source_url': url, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest(), 'md5': hashlib.md5(data).hexdigest(), 'expected_checksum': expected, 'expected_algorithm': algo, 'seconds': round(time.time()-started,3)})
+              print(json.dumps(manifest['files'][-1]), flush=True)
+              (root/'manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
+          obtain('weights/ProteinMPNN_v_48_020.pt', 'https://raw.githubusercontent.com/dauparas/ProteinMPNN/8907e6671bfbfc92303b5f79c4b5e6ce47cdef57/vanilla_model_weights/v_48_020.pt', 'c9cb4a671d79604111231f8dbfc7c590e06f1197453b7a6854ac6661a642f5bd')
+          obtain('weights/nanobody_model_1', 'https://zenodo.org/records/7258553/files/nanobody_model_1?download=1', '4591075f467ca9f76a37a5d1d3cfe591', 'md5')
+          ib = '0df4e2ad82a1aa60f37ea9dae335d1198159ef78'
+          for name in ['models.py','rigids.py','constants.py','util.py','sequence_checks.py','NanoBodyBuilder2.py']:
+              obtain('source/ImmuneBuilder/'+name, f'https://raw.githubusercontent.com/oxpig/ImmuneBuilder/{ib}/ImmuneBuilder/{name}', limit=2_000_000)
+          obtain('source/ImmuneBuilder/LICENSE', f'https://raw.githubusercontent.com/oxpig/ImmuneBuilder/{ib}/LICENSE', limit=100_000)
+          pm = '8907e6671bfbfc92303b5f79c4b5e6ce47cdef57'
+          for name in ['protein_mpnn_run.py','protein_mpnn_utils.py','LICENSE']:
+              obtain('source/ProteinMPNN/'+name, f'https://raw.githubusercontent.com/dauparas/ProteinMPNN/{pm}/{name}', limit=2_000_000)
+          manifest['all_requested_assets_verified'] = True
+          (root/'manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
+          PY
+      - name: Preserve verified public assets for offline compatibility tests
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-protein-model-assets
+          path: public_model_assets/
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
