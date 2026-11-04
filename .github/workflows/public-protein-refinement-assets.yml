@@ -1,0 +1,61 @@
+name: Public protein refinement dependency check
+on:
+  push:
+    branches: [tnfa-public-model-assets-20261104]
+    paths: [.github/workflows/public-protein-refinement-assets.yml]
+permissions:
+  contents: read
+jobs:
+  public-refinement-assets:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Retrieve only public software dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import urllib.request, json, hashlib
+          root=Path('refinement_assets');root.mkdir()
+          manifest={'scope':'PUBLIC_DEPENDENCIES_ONLY_NO_USER_SEQUENCES','files':[]}
+          def get(url):
+              return urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'public-model-integrity-check/1.0'}),timeout=180)
+          def save(name,url,expected=None):
+              p=root/name;p.parent.mkdir(parents=True,exist_ok=True)
+              with get(url) as r,p.open('xb') as f:
+                  size=0
+                  while True:
+                      b=r.read(1024*1024)
+                      if not b:break
+                      size+=len(b)
+                      if size>90_000_000:raise RuntimeError('Size cap')
+                      f.write(b)
+              digest=hashlib.sha256(p.read_bytes()).hexdigest()
+              if expected and digest!=expected:raise RuntimeError('Checksum mismatch')
+              manifest['files'].append({'path':name,'url':url,'bytes':size,'sha256':digest})
+              print(json.dumps(manifest['files'][-1]),flush=True)
+              (root/'manifest.json').write_text(json.dumps(manifest,indent=2))
+          with get('https://pypi.org/pypi/openmm/8.4.0/json') as r: info=json.load(r)
+          choices=[x for x in info['urls'] if '-cp313-cp313-' in x['filename'] and 'manylinux' in x['filename'] and 'x86_64' in x['filename']]
+          if len(choices)!=1: raise RuntimeError('Expected one OpenMM CPython 3.13 Linux wheel, got '+str([x['filename'] for x in choices]))
+          x=choices[0];save('wheels/'+x['filename'],x['url'],x['digests']['sha256'])
+          with get('https://api.github.com/repos/openmm/pdbfixer/commits/master') as r: commit=json.load(r)['sha']
+          manifest['pdbfixer_commit']=commit
+          save('pdbfixer-'+commit+'.zip','https://codeload.github.com/openmm/pdbfixer/zip/'+commit)
+          save('ImmuneBuilder_refine.py','https://raw.githubusercontent.com/oxpig/ImmuneBuilder/0df4e2ad82a1aa60f37ea9dae335d1198159ef78/ImmuneBuilder/refine.py')
+          with get('https://pypi.org/pypi/anarcii/2.0.8/json') as r: ai=json.load(r)
+          aw=[x for x in ai['urls'] if x['filename'].endswith('py3-none-any.whl')]
+          if len(aw)==1:
+              x=aw[0];save('wheels/'+x['filename'],x['url'],x['digests']['sha256'])
+          manifest['completed']=True
+          (root/'manifest.json').write_text(json.dumps(manifest,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: public-protein-refinement-assets
+          path: refinement_assets/
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
